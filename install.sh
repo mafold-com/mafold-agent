@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Install + run mafold (Mafold terminal client + Claude Code agent).
+#   cd ~/your-project
 #   bash <(curl -fsSL https://raw.githubusercontent.com/mafold-com/mafold-cli/main/install.sh) \
-#     agent --detach --token mb_xxxx --workdir ~/your-repo
-# Any args after the script are forwarded to mafold.
+#     agent --detach --token mb_xxxx
+# Any args after the script are forwarded to mafold (working dir = where you run this).
 set -euo pipefail
 REPO="mafold-com/mafold-cli"
 
@@ -23,18 +24,22 @@ echo "↓ downloading mafold ($target)…"
 curl -fsSL "$url" -o "$bin"
 chmod +x "$bin"
 
-# Best-effort: put `mafold` on PATH so you can run it directly later.
-linked=""
-for d in "/usr/local/bin" "${HOME}/.local/bin"; do
-  if [ -d "$d" ] && [ -w "$d" ]; then ln -sf "$bin" "$d/mafold" && linked="$d/mafold" && break; fi
+# Put `mafold` on PATH. Prefer a dir that is BOTH on PATH and writable (so the
+# command works immediately); else ~/.local/bin with a one-line PATH hint.
+on_path() { case ":$PATH:" in *":$1:"*) return 0;; *) return 1;; esac; }
+bindir=""
+for d in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin"; do
+  if [ -d "$d" ] && [ -w "$d" ] && on_path "$d"; then bindir="$d"; break; fi
 done
-if [ -z "$linked" ]; then
-  mkdir -p "${HOME}/.local/bin" && ln -sf "$bin" "${HOME}/.local/bin/mafold" && linked="${HOME}/.local/bin/mafold" || true
+if [ -z "$bindir" ]; then bindir="$HOME/.local/bin"; mkdir -p "$bindir"; fi
+ln -sf "$bin" "$bindir/mafold"
+echo "✓ installed → $bindir/mafold"
+if ! on_path "$bindir"; then
+  echo "ℹ️  add to PATH (then reopen the shell):  echo 'export PATH=\"$bindir:\$PATH\"' >> ~/.zshrc"
 fi
-echo "✓ installed → $bin${linked:+  (linked: $linked)}"
 
 if [ "$#" -gt 0 ]; then
-  exec "$bin" "$@"
+  exec "$bindir/mafold" "$@"
 else
-  echo "run:  mafold agent --detach --token mb_xxx --workdir ~/your-repo"
+  echo "run:  mafold agent --detach --token mb_xxx        # works in the current folder"
 fi

@@ -65,8 +65,15 @@ async fn main() -> Result<()> {
 
     match cli.cmd {
         Cmd::Agent { workdir, detach } => {
+            // Resolve to an absolute path (default "." = the current folder), so
+            // the agent — and the detached child, which has a different cwd —
+            // both operate on the same real directory. No fake placeholders.
+            let workdir = std::fs::canonicalize(&workdir)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or(workdir);
             if detach {
                 let pid = daemon::start_detached(&cli.base, &token, &workdir)?;
+                println!("  workdir: {workdir}");
                 println!("✓ agent running in background (pid {pid})");
                 println!("  logs:   ~/.mafold/agent.log");
                 println!("  status: mafold status");
