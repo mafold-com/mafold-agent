@@ -1,13 +1,22 @@
 //! Agent daemon — run Claude Code as your Mafold bot. Connects over WS, and for
 //! each incoming message drives the local `claude` in the working directory and
 //! streams the reply back. Always finalizes (never leaves the chat on "typing…").
+//!
+//! Context: each Mafold conversation maps to one persistent Claude Code session
+//! (`--resume <session_id>`), so follow-ups keep the full prior context + tool
+//! work. The map is persisted to ~/.mafold/sessions.json so context survives a
+//! daemon restart (Claude Code stores the sessions on disk).
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::Mutex;
 
 use crate::client::Client;
 
@@ -19,6 +28,25 @@ struct IncomingMessage {
     sender: Sender,
     #[serde(default)]
     content: String,
+}
+
+// ── per-conversation Claude session map (persisted) ──
+type Sessions = Arc<Mutex<HashMap<String, String>>>;
+
+fn sessions_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home).join(".mafold").join("sessions.json")
+}
+fn load_sessions() -> HashMap<String, String> {
+    std::fs::read_to_string(sessions_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+fn save_sessions(map: &HashMap<String, String>) {
+    if let Ok(s) = serde_json::to_string(map) {
+        let _ = std::fs::write(sessions_path(), s);
+    }
 }
 
 pub async fn run(client: Client, workdir: String) -> Result<()> {
@@ -35,6 +63,12 @@ pub async fn run(client: Client, workdir: String) -> Result<()> {
         .context("WebSocket connect failed")?;
     let (mut write, mut read) = ws.split();
     println!("listening for messages to @{my_username} …");
+
+    let sessions: Sessions = Arc::new(Mutex::new(load_sessions()));
+    // Serialize claude runs: same workdir → concurrent edits/sessions would
+    // clash. One at a time (queued); each message still shows "typing" while it
+    // waits because we open the draft before taking the lock.
+    let exec_lock = Arc::new(Mutex::new(()));
 
     // Keepalive so the heartbeat keeps the bot marked online.
     tokio::spawn(async move {
@@ -58,8 +92,10 @@ pub async fn run(client: Client, workdir: String) -> Result<()> {
         println!("← @{}: {}", m.sender.username, m.content);
         let client = client.clone();
         let workdir = workdir.clone();
+        let sessions = sessions.clone();
+        let exec_lock = exec_lock.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle(&client, &workdir, &m.conversation_id, &m.content).await {
+            if let Err(e) = handle(&client, &workdir, &m.conversation_id, &m.content, &sessions, &exec_lock).await {
                 eprintln!("handle error: {e}");
             }
         });
@@ -68,14 +104,33 @@ pub async fn run(client: Client, workdir: String) -> Result<()> {
     Ok(())
 }
 
-/// Open a draft, stream claude's reply, ALWAYS finalize (surfacing any error).
-async fn handle(client: &Client, workdir: &str, chat_id: &str, prompt: &str) -> Result<()> {
+/// Open a draft, run claude (resuming this conversation's session), ALWAYS
+/// finalize (surfacing any error).
+async fn handle(
+    client: &Client,
+    workdir: &str,
+    chat_id: &str,
+    prompt: &str,
+    sessions: &Sessions,
+    exec_lock: &Arc<Mutex<()>>,
+) -> Result<()> {
     let msg_id = client.create_draft(chat_id).await?;
-    match stream_claude(client, workdir, prompt, &msg_id).await {
+
+    // Serialize: only one claude runs at a time in this workdir.
+    let _guard = exec_lock.lock().await;
+    let prior = sessions.lock().await.get(chat_id).cloned();
+
+    match stream_claude(client, workdir, prompt, &msg_id, prior.as_deref(), sessions, chat_id).await {
         Ok(true) => {}
         Ok(false) => { let _ = client.append_delta(&msg_id, "_(the agent produced no output)_").await; }
         Err(e) => {
             eprintln!("claude failed: {e}");
+            // A stale/expired resumed session → drop it so the next message
+            // starts fresh instead of failing again.
+            if prior.is_some() {
+                let mut s = sessions.lock().await;
+                if s.remove(chat_id).is_some() { save_sessions(&s); }
+            }
             let _ = client.append_delta(&msg_id, &format!("⚠️ Agent error: {e}")).await;
         }
     }
@@ -84,16 +139,29 @@ async fn handle(client: &Client, workdir: &str, chat_id: &str, prompt: &str) -> 
     Ok(())
 }
 
-async fn stream_claude(client: &Client, workdir: &str, prompt: &str, msg_id: &str) -> Result<bool> {
+async fn stream_claude(
+    client: &Client,
+    workdir: &str,
+    prompt: &str,
+    msg_id: &str,
+    prior_session: Option<&str>,
+    sessions: &Sessions,
+    chat_id: &str,
+) -> Result<bool> {
     if !std::path::Path::new(workdir).is_dir() {
         anyhow::bail!("working directory does not exist: {workdir} — check --workdir");
     }
-    let mut child = tokio::process::Command::new("claude")
-        .arg("-p").arg(prompt)
+    let mut cmd = tokio::process::Command::new("claude");
+    cmd.arg("-p").arg(prompt)
         .arg("--output-format").arg("stream-json")
         .arg("--verbose")
         .arg("--include-partial-messages")
-        .arg("--dangerously-skip-permissions")
+        .arg("--dangerously-skip-permissions");
+    // Resume this conversation's session → full prior context.
+    if let Some(sid) = prior_session {
+        cmd.arg("--resume").arg(sid);
+    }
+    let mut child = cmd
         .current_dir(workdir)
         .env_remove("CLAUDECODE")
         .env_remove("ANTHROPIC_API_KEY")
@@ -106,12 +174,19 @@ async fn stream_claude(client: &Client, workdir: &str, prompt: &str, msg_id: &st
     let mut lines = BufReader::new(stdout).lines();
     let mut buf = String::new();
     let mut produced = false;
+    let mut session_id: Option<String> = None;
     let mut last_flush = Instant::now();
 
     while let Some(line) = lines.next_line().await? {
         let line = line.trim();
         if line.is_empty() { continue; }
         let v: serde_json::Value = match serde_json::from_str(line) { Ok(v) => v, Err(_) => continue };
+        // Capture the session id (present on every event; first wins).
+        if session_id.is_none() {
+            if let Some(sid) = v["session_id"].as_str() {
+                session_id = Some(sid.to_string());
+            }
+        }
         if v["type"] == "stream_event"
             && v["event"]["type"] == "content_block_delta"
             && v["event"]["delta"]["type"] == "text_delta"
@@ -129,6 +204,15 @@ async fn stream_claude(client: &Client, workdir: &str, prompt: &str, msg_id: &st
         if v["type"] == "result" { break; }
     }
     if !buf.is_empty() { let _ = client.append_delta(msg_id, &buf).await; }
+
+    // Remember the session for this conversation so the next message resumes it.
+    if let Some(sid) = session_id {
+        let mut s = sessions.lock().await;
+        if s.get(chat_id).map(String::as_str) != Some(sid.as_str()) {
+            s.insert(chat_id.to_string(), sid);
+            save_sessions(&s);
+        }
+    }
 
     let status = child.wait().await?;
     if !status.success() {
