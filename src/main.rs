@@ -9,6 +9,7 @@
 mod agent;
 mod client;
 mod daemon;
+mod update;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -21,6 +22,9 @@ struct Cli {
     base: String,
     #[arg(long, env = "MAFOLD_BOT_TOKEN", global = true)]
     token: Option<String>,
+    /// Disable the agent's hourly auto-update.
+    #[arg(long, env = "MAFOLD_NO_AUTO_UPDATE", global = true)]
+    no_auto_update: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -41,6 +45,8 @@ enum Cmd {
     Stop,
     /// Show whether a background agent is running.
     Status,
+    /// Update mafold to the latest release.
+    Update,
     /// List your conversations.
     Chats,
     /// Send a message. <chat> is a conversation id or a @username.
@@ -55,9 +61,18 @@ enum Cmd {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Daemon control needs no auth.
+    // Daemon control + self-update need no auth.
     if matches!(cli.cmd, Cmd::Stop) { return daemon::stop(); }
     if matches!(cli.cmd, Cmd::Status) { return daemon::status(); }
+    if matches!(cli.cmd, Cmd::Update) {
+        let http = reqwest::Client::new();
+        match update::update_to_latest(&http).await {
+            Ok(Some(v)) => println!("✓ updated to v{v} — restart a running agent with: mafold stop && mafold agent --detach …"),
+            Ok(None) => println!("already up to date (v{})", update::current_version()),
+            Err(e) => { eprintln!("update failed: {e}"); std::process::exit(1); }
+        }
+        return Ok(());
+    }
 
     let token = cli
         .token
@@ -79,12 +94,12 @@ async fn main() -> Result<()> {
                 println!("  status: mafold status");
                 println!("  stop:   mafold stop");
             } else {
-                agent::run(Client::new(cli.base, token), workdir).await?;
+                agent::run(Client::new(cli.base, token), workdir, !cli.no_auto_update).await?;
             }
         }
         Cmd::Chats => chats(&Client::new(cli.base, token)).await?,
         Cmd::Send { chat, text } => send(&Client::new(cli.base, token), &chat, &text.join(" ")).await?,
-        Cmd::Stop | Cmd::Status => unreachable!(),
+        Cmd::Stop | Cmd::Status | Cmd::Update => unreachable!(),
     }
     Ok(())
 }

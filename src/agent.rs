@@ -49,7 +49,18 @@ fn save_sessions(map: &HashMap<String, String>) {
     }
 }
 
-pub async fn run(client: Client, workdir: String) -> Result<()> {
+pub async fn run(client: Client, workdir: String, auto_update: bool) -> Result<()> {
+    // Self-update on startup (before connecting) so a (re)started agent is
+    // always current; if it updates, re-exec into the new binary.
+    if auto_update {
+        if let Ok(Some((v, url))) = crate::update::check(&client.http).await {
+            println!("↻ updating to v{v}…");
+            if crate::update::apply(&client.http, &url).await.is_ok() {
+                let _ = crate::update::reexec(); // replaces this process
+            }
+        }
+    }
+
     let me = client.me().await.context("getMe failed — check the token / --base")?;
     let my_username = me["username"].as_str().unwrap_or_default().to_string();
     anyhow::ensure!(!my_username.is_empty(), "could not resolve bot identity (bad token?)");
@@ -75,6 +86,35 @@ pub async fn run(client: Client, workdir: String) -> Result<()> {
     // clash. One at a time (queued); each message still shows "typing" while it
     // waits because we open the draft before taking the lock.
     let exec_lock = Arc::new(Mutex::new(()));
+
+    // Hourly auto-update: check; if a newer release exists, apply + re-exec —
+    // but only when IDLE (try_lock succeeds → no claude running/queued) so we
+    // never kill an in-flight reply. Busy → retry next hour.
+    if auto_update {
+        let client = client.clone();
+        let exec_lock = exec_lock.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(3600));
+            tick.tick().await; // consume the immediate first tick
+            loop {
+                tick.tick().await;
+                match crate::update::check(&client.http).await {
+                    Ok(Some((v, url))) => {
+                        if let Ok(_g) = exec_lock.try_lock() {
+                            println!("↻ updating to v{v} — restarting…");
+                            if crate::update::apply(&client.http, &url).await.is_ok() {
+                                let _ = crate::update::reexec();
+                            }
+                        } else {
+                            println!("update v{v} available — will apply when idle");
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => eprintln!("auto-update check failed: {e}"),
+                }
+            }
+        });
+    }
 
     // Keepalive so the heartbeat keeps the bot marked online.
     tokio::spawn(async move {
