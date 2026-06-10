@@ -75,12 +75,6 @@ pub async fn run(client: Client, workdir: String, auto_update: bool) -> Result<(
         { "command": "help",  "description": "What this agent can do" },
     ])).await;
 
-    let (ws, _) = tokio_tungstenite::connect_async(&client.ws_url())
-        .await
-        .context("WebSocket connect failed")?;
-    let (mut write, mut read) = ws.split();
-    println!("listening for messages to @{my_username} …");
-
     let sessions: Sessions = Arc::new(Mutex::new(load_sessions()));
     // Serialize claude runs: same workdir → concurrent edits/sessions would
     // clash. One at a time (queued); each message still shows "typing" while it
@@ -116,8 +110,36 @@ pub async fn run(client: Client, workdir: String, auto_update: bool) -> Result<(
         });
     }
 
+    // Reconnect loop: a dropped WS (network blip, server restart) must NOT kill
+    // the daemon. Reconnect with backoff; sessions/exec_lock persist across it.
+    let mut backoff = 1u64;
+    loop {
+        if let Err(e) = connect_and_run(&client, &workdir, &my_username, &sessions, &exec_lock).await {
+            eprintln!("connection error: {e}");
+        }
+        eprintln!("reconnecting in {backoff}s…");
+        tokio::time::sleep(Duration::from_secs(backoff)).await;
+        backoff = (backoff * 2).min(30);
+    }
+}
+
+/// One WS session: connect, keepalive-ping, dispatch incoming messages. Returns
+/// when the socket drops (so the caller reconnects).
+async fn connect_and_run(
+    client: &Client,
+    workdir: &str,
+    my_username: &str,
+    sessions: &Sessions,
+    exec_lock: &Arc<Mutex<()>>,
+) -> Result<()> {
+    let (ws, _) = tokio_tungstenite::connect_async(&client.ws_url())
+        .await
+        .context("WebSocket connect failed")?;
+    let (mut write, mut read) = ws.split();
+    println!("listening for messages to @{my_username} …");
+
     // Keepalive so the heartbeat keeps the bot marked online.
-    tokio::spawn(async move {
+    let ping = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(25));
         loop {
             tick.tick().await;
@@ -133,7 +155,7 @@ pub async fn run(client: Client, workdir: String, auto_update: bool) -> Result<(
         let env: serde_json::Value = match serde_json::from_str(&text) { Ok(v) => v, Err(_) => continue };
         if env.get("method").and_then(|m| m.as_str()) != Some("events.messageNew") { continue; }
         let m: IncomingMessage = match serde_json::from_value(env["params"].clone()) { Ok(m) => m, Err(_) => continue };
-        if m.sender.username.eq_ignore_ascii_case(&my_username) || m.content.trim().is_empty() { continue; }
+        if m.sender.username.eq_ignore_ascii_case(my_username) || m.content.trim().is_empty() { continue; }
 
         println!("← @{}: {}", m.sender.username, m.content);
 
@@ -154,7 +176,7 @@ pub async fn run(client: Client, workdir: String, auto_update: bool) -> Result<(
         }
 
         let client = client.clone();
-        let workdir = workdir.clone();
+        let workdir = workdir.to_string();
         let sessions = sessions.clone();
         let exec_lock = exec_lock.clone();
         tokio::spawn(async move {
@@ -163,6 +185,7 @@ pub async fn run(client: Client, workdir: String, auto_update: bool) -> Result<(
             }
         });
     }
+    ping.abort();
     println!("disconnected.");
     Ok(())
 }
