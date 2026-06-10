@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::Mutex;
 
@@ -172,16 +172,45 @@ async fn stream_claude(
 
     let stdout = child.stdout.take().context("no stdout")?;
     let mut lines = BufReader::new(stdout).lines();
-    let mut buf = String::new();
+
+    // Decouple network sends from reading claude's stdout: a sender task drains
+    // a channel and POSTs batched, ORDERED deltas. So a slow append never stalls
+    // reading — long replies stream smoothly even on a slow link.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let sender = {
+        let client = client.clone();
+        let msg_id = msg_id.to_string();
+        tokio::spawn(async move {
+            let mut buf = String::new();
+            loop {
+                match tokio::time::timeout(Duration::from_millis(120), rx.recv()).await {
+                    Ok(Some(chunk)) => {
+                        buf.push_str(&chunk);
+                        if buf.len() >= 240 {
+                            let _ = client.append_delta(&msg_id, &buf).await;
+                            buf.clear();
+                        }
+                    }
+                    Ok(None) => break,           // channel closed → claude done
+                    Err(_) => {                  // idle ~120ms → flush what we have
+                        if !buf.is_empty() {
+                            let _ = client.append_delta(&msg_id, &buf).await;
+                            buf.clear();
+                        }
+                    }
+                }
+            }
+            if !buf.is_empty() { let _ = client.append_delta(&msg_id, &buf).await; }
+        })
+    };
+
     let mut produced = false;
     let mut session_id: Option<String> = None;
-    let mut last_flush = Instant::now();
 
     while let Some(line) = lines.next_line().await? {
         let line = line.trim();
         if line.is_empty() { continue; }
         let v: serde_json::Value = match serde_json::from_str(line) { Ok(v) => v, Err(_) => continue };
-        // Capture the session id (present on every event; first wins).
         if session_id.is_none() {
             if let Some(sid) = v["session_id"].as_str() {
                 session_id = Some(sid.to_string());
@@ -192,34 +221,23 @@ async fn stream_claude(
             && v["event"]["delta"]["type"] == "text_delta"
         {
             if let Some(t) = v["event"]["delta"]["text"].as_str() {
-                buf.push_str(t);
+                let _ = tx.send(t.to_string());
                 produced = true;
-                if buf.len() >= 120 || last_flush.elapsed() >= Duration::from_millis(120) {
-                    let _ = client.append_delta(msg_id, &buf).await;
-                    buf.clear();
-                    last_flush = Instant::now();
-                }
             }
         }
-        // Tool use → emit a compact {% tool %} card so the chat shows the work.
-        // The full assistant step (with tool_use blocks + their inputs) arrives
-        // as a `type:"assistant"` event.
+        // Tool use → a compact {% tool %} card (shows the work as it happens, so
+        // a long agentic turn doesn't look frozen on "typing").
         if v["type"] == "assistant" {
             if let Some(blocks) = v["message"]["content"].as_array() {
                 for b in blocks {
                     if b["type"] == "tool_use" {
                         let name = b["name"].as_str().unwrap_or("tool");
                         let detail = tool_detail(name, &b["input"]);
-                        if !buf.is_empty() {
-                            let _ = client.append_delta(msg_id, &buf).await;
-                            buf.clear();
-                            last_flush = Instant::now();
-                        }
                         let tag = format!(
                             "\n{{% tool name=\"{}\" detail=\"{}\" /%}}\n",
                             attr_esc(name), attr_esc(&detail)
                         );
-                        let _ = client.append_delta(msg_id, &tag).await;
+                        let _ = tx.send(tag);
                         produced = true;
                     }
                 }
@@ -227,7 +245,8 @@ async fn stream_claude(
         }
         if v["type"] == "result" { break; }
     }
-    if !buf.is_empty() { let _ = client.append_delta(msg_id, &buf).await; }
+    drop(tx);             // close the channel → sender flushes the tail + exits
+    let _ = sender.await;
 
     // Remember the session for this conversation so the next message resumes it.
     if let Some(sid) = session_id {
