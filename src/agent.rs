@@ -201,6 +201,30 @@ async fn stream_claude(
                 }
             }
         }
+        // Tool use → emit a compact {% tool %} card so the chat shows the work.
+        // The full assistant step (with tool_use blocks + their inputs) arrives
+        // as a `type:"assistant"` event.
+        if v["type"] == "assistant" {
+            if let Some(blocks) = v["message"]["content"].as_array() {
+                for b in blocks {
+                    if b["type"] == "tool_use" {
+                        let name = b["name"].as_str().unwrap_or("tool");
+                        let detail = tool_detail(name, &b["input"]);
+                        if !buf.is_empty() {
+                            let _ = client.append_delta(msg_id, &buf).await;
+                            buf.clear();
+                            last_flush = Instant::now();
+                        }
+                        let tag = format!(
+                            "\n{{% tool name=\"{}\" detail=\"{}\" /%}}\n",
+                            attr_esc(name), attr_esc(&detail)
+                        );
+                        let _ = client.append_delta(msg_id, &tag).await;
+                        produced = true;
+                    }
+                }
+            }
+        }
         if v["type"] == "result" { break; }
     }
     if !buf.is_empty() { let _ = client.append_delta(msg_id, &buf).await; }
@@ -225,4 +249,32 @@ async fn stream_claude(
         anyhow::bail!("claude exited unsuccessfully{}", if err.is_empty() { String::new() } else { format!(": {err}") });
     }
     Ok(produced)
+}
+
+/// A short, human-readable detail for a tool-use card (the file, command, …).
+fn tool_detail(name: &str, input: &serde_json::Value) -> String {
+    let raw = match name.to_lowercase().as_str() {
+        "bash" => input["command"].as_str(),
+        "edit" | "write" | "multiedit" | "read" | "notebookedit" => input["file_path"].as_str(),
+        "glob" | "grep" => input["pattern"].as_str(),
+        "webfetch" => input["url"].as_str(),
+        "task" => input["description"].as_str(),
+        "todowrite" => Some("updating plan"),
+        _ => None,
+    };
+    raw.unwrap_or("").to_string()
+}
+
+/// Sanitize a value for a markdoc attribute: no quotes/newlines, capped length.
+fn attr_esc(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| match c { '"' => '\'', '\n' | '\r' | '\t' => ' ', _ => c })
+        .collect();
+    let cleaned = cleaned.trim();
+    if cleaned.chars().count() > 80 {
+        format!("{}…", cleaned.chars().take(80).collect::<String>())
+    } else {
+        cleaned.to_string()
+    }
 }
