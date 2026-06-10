@@ -1,8 +1,8 @@
 //! mafold-cli — Mafold from your terminal.
 //!
-//!   mafold-cli agent --token mb_… --workdir ~/repo   # run Claude Code as your bot
-//!   mafold-cli --token mb_… chats                     # list conversations
-//!   mafold-cli --token mb_… send @alice "hi there"    # send a message
+//!   mafold agent --token mb_… --workdir ~/repo   # run Claude Code as your bot
+//!   mafold --token mb_… chats                     # list conversations
+//!   mafold --token mb_… send @alice "hi there"    # send a message
 //!
 //! Auth is a bot token (`mb_…`) via --token or $MAFOLD_BOT_TOKEN.
 
@@ -15,7 +15,7 @@ use clap::{Parser, Subcommand};
 use client::Client;
 
 #[derive(Parser)]
-#[command(name = "mafold-cli", version, about = "Mafold from your terminal — CLI client + Claude Code agent")]
+#[command(name = "mafold", version, about = "Mafold from your terminal — CLI client + Claude Code agent")]
 struct Cli {
     #[arg(long, env = "MAFOLD_BASE", default_value = "https://api.mafold.com", global = true)]
     base: String,
@@ -69,8 +69,8 @@ async fn main() -> Result<()> {
                 let pid = daemon::start_detached(&cli.base, &token, &workdir)?;
                 println!("✓ agent running in background (pid {pid})");
                 println!("  logs:   ~/.mafold/agent.log");
-                println!("  status: mafold-cli status");
-                println!("  stop:   mafold-cli stop");
+                println!("  status: mafold status");
+                println!("  stop:   mafold stop");
             } else {
                 agent::run(Client::new(cli.base, token), workdir).await?;
             }

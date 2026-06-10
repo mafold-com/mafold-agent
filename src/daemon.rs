@@ -28,7 +28,7 @@ fn alive(pid: i32) -> bool { unsafe { libc::kill(pid, 0) == 0 } }
 pub fn start_detached(base: &str, token: &str, workdir: &str) -> Result<u32> {
     if let Some(pid) = read_pid() {
         if alive(pid) {
-            anyhow::bail!("agent already running (pid {pid}) — run `mafold-cli stop` first");
+            anyhow::bail!("agent already running (pid {pid}) — run `mafold stop` first");
         }
     }
     let exe = std::env::current_exe()?;

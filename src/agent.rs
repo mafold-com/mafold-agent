@@ -28,7 +28,7 @@ pub async fn run(client: Client, workdir: String) -> Result<()> {
     if !std::path::Path::new(&workdir).is_dir() {
         eprintln!("⚠️  working directory does not exist: {workdir} — claude will fail. Check --workdir.");
     }
-    println!("mafold-cli agent ✓ connected as @{my_username}  ·  workdir={workdir}");
+    println!("mafold agent ✓ connected as @{my_username}  ·  workdir={workdir}");
 
     let (ws, _) = tokio_tungstenite::connect_async(&client.ws_url())
         .await

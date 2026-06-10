@@ -6,7 +6,7 @@ description = "Mafold from your terminal — a CLI client (chats / send) + a Cla
 license = "MIT"
 
 [[bin]]
-name = "mafold-cli"
+name = "mafold"
 path = "src/main.rs"
 
 [dependencies]

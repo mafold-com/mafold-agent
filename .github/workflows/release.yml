@@ -26,7 +26,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - run: cargo build --release --target ${{ matrix.target }}
-      - run: cp "target/${{ matrix.target }}/release/mafold-cli" "mafold-cli-${{ matrix.target }}"
+      - run: cp "target/${{ matrix.target }}/release/mafold" "mafold-${{ matrix.target }}"
       - uses: softprops/action-gh-release@v2
         with:
-          files: mafold-cli-${{ matrix.target }}
+          files: mafold-${{ matrix.target }}

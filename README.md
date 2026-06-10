@@ -3,9 +3,9 @@
 Mafold from your terminal — a small CLI client **and** a Claude Code agent daemon.
 
 ```
-mafold-cli agent --token mb_xxxx --workdir ~/your-repo   # run Claude Code as your bot
-mafold-cli --token mb_xxxx chats                          # list your conversations
-mafold-cli --token mb_xxxx send @alice "hi there"         # send a message
+mafold agent --token mb_xxxx --workdir ~/your-repo   # run Claude Code as your bot
+mafold --token mb_xxxx chats                          # list your conversations
+mafold --token mb_xxxx send @alice "hi there"         # send a message
 ```
 
 Auth is a **bot token** (`mb_…`) — create a bot in the Mafold app — via
@@ -21,7 +21,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/mafold-com/mafold-cli/main/i
 
 It runs in the **background** (detached from the terminal — keeps running after
 you close the shell), logging to `~/.mafold/agent.log`. Manage it with
-`mafold-cli status` and `mafold-cli stop`. Drop `--detach` to run in the
+`mafold status` and `mafold stop`. Drop `--detach` to run in the
 foreground. Or build from source: `cargo build --release`.
 
 ## `agent`
