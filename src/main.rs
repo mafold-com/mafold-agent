@@ -130,7 +130,7 @@ async fn main() -> Result<()> {
 
 /// Open a draft, stream Claude Code's reply into it, finalize.
 async fn handle(http: &reqwest::Client, cfg: &Config, chat_id: &str, prompt: &str) -> Result<()> {
-    // 1) open a streaming draft message from the bot
+    // 1) open a streaming draft message from the bot (this flips "typing" on).
     let draft: serde_json::Value = http
         .post(format!("{}/api/botCreateDraft", cfg.base))
         .bearer_auth(&cfg.token)
@@ -141,7 +141,34 @@ async fn handle(http: &reqwest::Client, cfg: &Config, chat_id: &str, prompt: &st
         .await?;
     let msg_id = draft["result"]["id"].as_str().context("no draft id")?.to_string();
 
-    // 2) drive claude in stream-json, parse text deltas
+    // 2) run claude. On ANY failure, surface it in the chat — we must NEVER
+    //    leave the draft unfinalized, or the conversation hangs on "typing…".
+    match stream_claude(http, cfg, prompt, &msg_id).await {
+        Ok(true) => {}
+        Ok(false) => flush(http, cfg, &msg_id, "_(the agent produced no output)_").await,
+        Err(e) => {
+            eprintln!("claude failed: {e}");
+            flush(http, cfg, &msg_id, &format!("⚠️ Agent error: {e}")).await;
+        }
+    }
+
+    // 3) ALWAYS finalize.
+    let _ = http
+        .post(format!("{}/api/botFinalize", cfg.base))
+        .bearer_auth(&cfg.token)
+        .json(&serde_json::json!({ "message_id": msg_id }))
+        .send()
+        .await;
+    println!("→ finalized reply for chat {chat_id}");
+    Ok(())
+}
+
+/// Drive claude in stream-json, flushing text deltas into the draft. Returns
+/// whether any text was produced. Errors bubble up so `handle` can finalize.
+async fn stream_claude(http: &reqwest::Client, cfg: &Config, prompt: &str, msg_id: &str) -> Result<bool> {
+    if !std::path::Path::new(&cfg.workdir).is_dir() {
+        anyhow::bail!("working directory does not exist: {} — check --workdir", cfg.workdir);
+    }
     let mut child = tokio::process::Command::new("claude")
         .arg("-p")
         .arg(prompt)
@@ -158,55 +185,48 @@ async fn handle(http: &reqwest::Client, cfg: &Config, chat_id: &str, prompt: &st
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("couldn't run `claude` — is Claude Code installed and on PATH?")?;
+        .with_context(|| format!("couldn't run `claude` in {} — is Claude Code installed and on PATH?", cfg.workdir))?;
 
     let stdout = child.stdout.take().context("no stdout")?;
     let mut lines = BufReader::new(stdout).lines();
     let mut buf = String::new();
+    let mut produced = false;
     let mut last_flush = Instant::now();
 
     while let Some(line) = lines.next_line().await? {
         let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let v: serde_json::Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        // stream_event → content_block_delta → text_delta
+        if line.is_empty() { continue; }
+        let v: serde_json::Value = match serde_json::from_str(line) { Ok(v) => v, Err(_) => continue };
         if v["type"] == "stream_event"
             && v["event"]["type"] == "content_block_delta"
             && v["event"]["delta"]["type"] == "text_delta"
         {
             if let Some(t) = v["event"]["delta"]["text"].as_str() {
                 buf.push_str(t);
-                // Batch (~120 chars / 120 ms) so we don't POST per token.
+                produced = true;
                 if buf.len() >= 120 || last_flush.elapsed() >= Duration::from_millis(120) {
-                    flush(http, cfg, &msg_id, &buf).await;
+                    flush(http, cfg, msg_id, &buf).await;
                     buf.clear();
                     last_flush = Instant::now();
                 }
             }
         }
-        if v["type"] == "result" {
-            break;
-        }
+        if v["type"] == "result" { break; }
     }
-    if !buf.is_empty() {
-        flush(http, cfg, &msg_id, &buf).await;
-    }
+    if !buf.is_empty() { flush(http, cfg, msg_id, &buf).await; }
 
-    // 3) finalize
-    let _ = http
-        .post(format!("{}/api/botFinalize", cfg.base))
-        .bearer_auth(&cfg.token)
-        .json(&serde_json::json!({ "message_id": msg_id }))
-        .send()
-        .await;
-    let _ = child.wait().await;
-    println!("→ finalized reply for chat {chat_id}");
-    Ok(())
+    // If claude exited non-zero, surface its stderr (e.g. auth/rate errors).
+    let status = child.wait().await?;
+    if !status.success() {
+        let mut err = String::new();
+        if let Some(mut se) = child.stderr.take() {
+            use tokio::io::AsyncReadExt;
+            let _ = se.read_to_string(&mut err).await;
+        }
+        let err = err.trim();
+        anyhow::bail!("claude exited unsuccessfully{}", if err.is_empty() { String::new() } else { format!(": {err}") });
+    }
+    Ok(produced)
 }
 
 async fn flush(http: &reqwest::Client, cfg: &Config, msg_id: &str, delta: &str) {
