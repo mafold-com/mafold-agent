@@ -1,29 +1,37 @@
 //! mafold-agent — run Claude Code as YOUR Mafold bot, on YOUR machine.
 //!
 //! You create a bot in the Mafold app (get its `mb_…` token), then run this
-//! with that token. It connects to Mafold, and whenever someone messages your
-//! bot it drives the local `claude` (Claude Code) in your working directory and
-//! sends the reply back. Everything runs on your machine, on your files.
+//! with that token. Whenever someone messages your bot, it drives the local
+//! `claude` (Claude Code) in your working directory and STREAMS the reply back.
+//! Everything runs on your machine, on your files.
 //!
 //!   MAFOLD_BOT_TOKEN=mb_xxx MAFOLD_WORKDIR=~/code/myrepo mafold-agent
-//!
-//! P0: headless one-shot (`claude -p`) + a single reply. Streaming + tool
-//! events + per-conversation sessions come next (see memory: claude-code-daemon).
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use serde::Deserialize;
-use std::process::Command;
+use std::process::Stdio;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 #[derive(Deserialize)]
-struct Sender { username: String }
-
+struct Sender {
+    username: String,
+}
 #[derive(Deserialize)]
 struct IncomingMessage {
     conversation_id: String,
     sender: Sender,
     #[serde(default)]
     content: String,
+}
+
+struct Config {
+    base: String,
+    token: String,
+    workdir: String,
+    me: String,
 }
 
 #[tokio::main]
@@ -34,7 +42,6 @@ async fn main() -> Result<()> {
     let workdir = std::env::var("MAFOLD_WORKDIR").unwrap_or_else(|_| ".".into());
     let http = reqwest::Client::new();
 
-    // Resolve our own identity so we don't reply to our own messages.
     let me: serde_json::Value = http
         .post(format!("{base}/api/getMe"))
         .bearer_auth(&token)
@@ -48,6 +55,13 @@ async fn main() -> Result<()> {
     anyhow::ensure!(!my_username.is_empty(), "could not resolve bot identity (bad token?)");
     println!("mafold-agent ✓ connected as @{my_username}  ·  workdir={workdir}");
 
+    let cfg = Arc::new(Config {
+        base: base.clone(),
+        token: token.clone(),
+        workdir,
+        me: my_username.clone(),
+    });
+
     let ws_base = base.replacen("https://", "wss://", 1).replacen("http://", "ws://", 1);
     let ws_url = format!("{ws_base}/api/ws?token={token}");
     let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
@@ -56,41 +70,129 @@ async fn main() -> Result<()> {
     println!("listening for messages to @{my_username} …");
 
     while let Some(frame) = ws.next().await {
-        let frame = match frame { Ok(f) => f, Err(e) => { eprintln!("ws error: {e}"); break; } };
-        let text = match frame.into_text() { Ok(t) => t, Err(_) => continue };
-        let env: serde_json::Value = match serde_json::from_str(&text) { Ok(v) => v, Err(_) => continue };
-        if env.get("method").and_then(|m| m.as_str()) != Some("events.messageNew") { continue; }
-        let m: IncomingMessage = match serde_json::from_value(env["params"].clone()) { Ok(m) => m, Err(_) => continue };
-        if m.sender.username.eq_ignore_ascii_case(&my_username) || m.content.trim().is_empty() { continue; }
+        let frame = match frame {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("ws error: {e}");
+                break;
+            }
+        };
+        let text = match frame.into_text() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let env: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if env.get("method").and_then(|m| m.as_str()) != Some("events.messageNew") {
+            continue;
+        }
+        let m: IncomingMessage = match serde_json::from_value(env["params"].clone()) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if m.sender.username.eq_ignore_ascii_case(&cfg.me) || m.content.trim().is_empty() {
+            continue;
+        }
 
         println!("← @{}: {}", m.sender.username, m.content);
-        let reply = run_claude(&m.content, &workdir).unwrap_or_else(|e| format!("⚠️ {e}"));
-        if let Err(e) = http
-            .post(format!("{base}/api/sendMessage"))
-            .bearer_auth(&token)
-            .json(&serde_json::json!({ "chat_id": m.conversation_id, "text": reply }))
-            .send()
-            .await
-        {
-            eprintln!("send failed: {e}");
-        } else {
-            println!("→ replied ({} chars)", reply.len());
-        }
+        let cfg = cfg.clone();
+        let http = http.clone();
+        // Handle concurrently so the socket keeps reading. (Single shared
+        // workdir — fine for one user; per-conversation isolation is later.)
+        tokio::spawn(async move {
+            if let Err(e) = handle(&http, &cfg, &m.conversation_id, &m.content).await {
+                eprintln!("handle error: {e}");
+            }
+        });
     }
     println!("disconnected.");
     Ok(())
 }
 
-/// Drive Claude Code headlessly in the working directory and return its reply.
-fn run_claude(prompt: &str, workdir: &str) -> Result<String> {
-    let out = Command::new("claude")
+/// Open a draft, stream Claude Code's reply into it, finalize.
+async fn handle(http: &reqwest::Client, cfg: &Config, chat_id: &str, prompt: &str) -> Result<()> {
+    // 1) open a streaming draft message from the bot
+    let draft: serde_json::Value = http
+        .post(format!("{}/api/botCreateDraft", cfg.base))
+        .bearer_auth(&cfg.token)
+        .json(&serde_json::json!({ "chat_id": chat_id }))
+        .send()
+        .await?
+        .json()
+        .await?;
+    let msg_id = draft["result"]["id"].as_str().context("no draft id")?.to_string();
+
+    // 2) drive claude in stream-json, parse text deltas
+    let mut child = tokio::process::Command::new("claude")
         .arg("-p")
         .arg(prompt)
-        .current_dir(workdir)
-        .output()
+        .arg("--output-format")
+        .arg("stream-json")
+        .arg("--verbose")
+        .arg("--include-partial-messages")
+        .arg("--dangerously-skip-permissions") // autonomous; P2 adds a policy
+        .current_dir(&cfg.workdir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .context("couldn't run `claude` — is Claude Code installed and on PATH?")?;
-    if !out.status.success() {
-        anyhow::bail!("claude failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+
+    let stdout = child.stdout.take().context("no stdout")?;
+    let mut lines = BufReader::new(stdout).lines();
+    let mut buf = String::new();
+    let mut last_flush = Instant::now();
+
+    while let Some(line) = lines.next_line().await? {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        // stream_event → content_block_delta → text_delta
+        if v["type"] == "stream_event"
+            && v["event"]["type"] == "content_block_delta"
+            && v["event"]["delta"]["type"] == "text_delta"
+        {
+            if let Some(t) = v["event"]["delta"]["text"].as_str() {
+                buf.push_str(t);
+                // Batch (~120 chars / 120 ms) so we don't POST per token.
+                if buf.len() >= 120 || last_flush.elapsed() >= Duration::from_millis(120) {
+                    flush(http, cfg, &msg_id, &buf).await;
+                    buf.clear();
+                    last_flush = Instant::now();
+                }
+            }
+        }
+        if v["type"] == "result" {
+            break;
+        }
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    if !buf.is_empty() {
+        flush(http, cfg, &msg_id, &buf).await;
+    }
+
+    // 3) finalize
+    let _ = http
+        .post(format!("{}/api/botFinalize", cfg.base))
+        .bearer_auth(&cfg.token)
+        .json(&serde_json::json!({ "message_id": msg_id }))
+        .send()
+        .await;
+    let _ = child.wait().await;
+    println!("→ finalized reply for chat {chat_id}");
+    Ok(())
+}
+
+async fn flush(http: &reqwest::Client, cfg: &Config, msg_id: &str, delta: &str) {
+    let _ = http
+        .post(format!("{}/api/botAppendDelta", cfg.base))
+        .bearer_auth(&cfg.token)
+        .json(&serde_json::json!({ "message_id": msg_id, "delta": delta }))
+        .send()
+        .await;
 }
