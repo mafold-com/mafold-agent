@@ -48,6 +48,13 @@ impl Client {
         Ok(())
     }
 
+    /// Download a media URL (an attachment `/media/…` path, or an absolute URL).
+    pub async fn download(&self, path: &str) -> Result<Vec<u8>> {
+        let url = if path.starts_with("http") { path.to_string() } else { format!("{}{}", self.base, path) };
+        let bytes = self.http.get(&url).send().await?.error_for_status()?.bytes().await?;
+        Ok(bytes.to_vec())
+    }
+
     /// Resolve a chat argument: a conversation UUID is used as-is; anything else
     /// is treated as a username (`@name` or `name`) → open/find the DM.
     pub async fn resolve_chat(&self, arg: &str) -> Result<String> {

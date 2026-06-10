@@ -22,12 +22,26 @@ use crate::client::Client;
 
 #[derive(Deserialize)]
 struct Sender { username: String }
+#[derive(Deserialize, Clone)]
+struct InAttachment {
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    url: Option<String>,
+}
 #[derive(Deserialize)]
 struct IncomingMessage {
     conversation_id: String,
     sender: Sender,
     #[serde(default)]
     content: String,
+    #[serde(default)]
+    attachments: Vec<InAttachment>,
+}
+
+fn attachments_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home).join(".mafold").join("attachments")
 }
 
 // ── per-conversation Claude session map (persisted) ──
@@ -155,7 +169,10 @@ async fn connect_and_run(
         let env: serde_json::Value = match serde_json::from_str(&text) { Ok(v) => v, Err(_) => continue };
         if env.get("method").and_then(|m| m.as_str()) != Some("events.messageNew") { continue; }
         let m: IncomingMessage = match serde_json::from_value(env["params"].clone()) { Ok(m) => m, Err(_) => continue };
-        if m.sender.username.eq_ignore_ascii_case(my_username) || m.content.trim().is_empty() { continue; }
+        // Skip our own echoes + truly empty messages — but an image-only
+        // message (empty text + attachments) is real, so keep it.
+        if m.sender.username.eq_ignore_ascii_case(my_username)
+            || (m.content.trim().is_empty() && m.attachments.is_empty()) { continue; }
 
         println!("← @{}: {}", m.sender.username, m.content);
 
@@ -179,8 +196,9 @@ async fn connect_and_run(
         let workdir = workdir.to_string();
         let sessions = sessions.clone();
         let exec_lock = exec_lock.clone();
+        let attachments = m.attachments.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle(&client, &workdir, &m.conversation_id, &m.content, &sessions, &exec_lock).await {
+            if let Err(e) = handle(&client, &workdir, &m.conversation_id, &m.content, &attachments, &sessions, &exec_lock).await {
                 eprintln!("handle error: {e}");
             }
         });
@@ -197,16 +215,45 @@ async fn handle(
     workdir: &str,
     chat_id: &str,
     prompt: &str,
+    attachments: &[InAttachment],
     sessions: &Sessions,
     exec_lock: &Arc<Mutex<()>>,
 ) -> Result<()> {
     let msg_id = client.create_draft(chat_id).await?;
 
+    // Download any image attachments locally so Claude can SEE them — its Read
+    // tool renders images. We reference the saved paths in the prompt.
+    let mut full_prompt = prompt.to_string();
+    let mut saved: Vec<String> = vec![];
+    for a in attachments {
+        if a.kind != "photo" { continue; }
+        let Some(url) = a.url.as_deref() else { continue };
+        match client.download(url).await {
+            Ok(bytes) => {
+                let name = url.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or("image.jpg");
+                let dir = attachments_dir();
+                let _ = std::fs::create_dir_all(&dir);
+                let path = dir.join(name);
+                if std::fs::write(&path, &bytes).is_ok() {
+                    saved.push(path.to_string_lossy().into_owned());
+                }
+            }
+            Err(e) => eprintln!("attachment download failed: {e}"),
+        }
+    }
+    if !saved.is_empty() {
+        let list = saved.iter().map(|p| format!("- {p}")).collect::<Vec<_>>().join("\n");
+        full_prompt = format!(
+            "{prompt}\n\n[The user attached {} image(s). Use your Read tool to view them:\n{list}]",
+            saved.len()
+        );
+    }
+
     // Serialize: only one claude runs at a time in this workdir.
     let _guard = exec_lock.lock().await;
     let prior = sessions.lock().await.get(chat_id).cloned();
 
-    match stream_claude(client, workdir, prompt, &msg_id, prior.as_deref(), sessions, chat_id).await {
+    match stream_claude(client, workdir, &full_prompt, &msg_id, prior.as_deref(), sessions, chat_id).await {
         Ok(true) => {}
         Ok(false) => { let _ = client.append_delta(&msg_id, "_(the agent produced no output)_").await; }
         Err(e) => {
