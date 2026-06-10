@@ -8,7 +8,7 @@
 //!   MAFOLD_BOT_TOKEN=mb_xxx MAFOLD_WORKDIR=~/code/myrepo mafold-agent
 
 use anyhow::{Context, Result};
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -64,12 +64,29 @@ async fn main() -> Result<()> {
 
     let ws_base = base.replacen("https://", "wss://", 1).replacen("http://", "ws://", 1);
     let ws_url = format!("{ws_base}/api/ws?token={token}");
-    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+    let (ws, _) = tokio_tungstenite::connect_async(&ws_url)
         .await
         .context("WebSocket connect failed")?;
+    let (mut write, mut read) = ws.split();
     println!("listening for messages to @{my_username} …");
 
-    while let Some(frame) = ws.next().await {
+    // Keepalive: ping every 25s so the server's heartbeat keeps the bot marked
+    // online (it's idle otherwise — we only receive).
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(25));
+        loop {
+            tick.tick().await;
+            if write
+                .send(tokio_tungstenite::tungstenite::Message::Ping(Vec::new().into()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    while let Some(frame) = read.next().await {
         let frame = match frame {
             Ok(f) => f,
             Err(e) => {
