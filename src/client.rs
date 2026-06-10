@@ -42,6 +42,12 @@ impl Client {
         self.post("sendMessage", json!({ "chat_id": chat_id, "text": text })).await
     }
 
+    /// Publish this bot's slash commands (the chat command panel).
+    pub async fn set_commands(&self, commands: Value) -> Result<()> {
+        self.post("setBotCommands", json!({ "commands": commands })).await?;
+        Ok(())
+    }
+
     /// Resolve a chat argument: a conversation UUID is used as-is; anything else
     /// is treated as a username (`@name` or `name`) → open/find the DM.
     pub async fn resolve_chat(&self, arg: &str) -> Result<String> {

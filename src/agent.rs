@@ -58,6 +58,12 @@ pub async fn run(client: Client, workdir: String) -> Result<()> {
     }
     println!("mafold agent ✓ connected as @{my_username}  ·  workdir={workdir}");
 
+    // Publish the command panel for this agent (Telegram-style).
+    let _ = client.set_commands(serde_json::json!([
+        { "command": "clear", "description": "Start a fresh conversation (clear context)" },
+        { "command": "help",  "description": "What this agent can do" },
+    ])).await;
+
     let (ws, _) = tokio_tungstenite::connect_async(&client.ws_url())
         .await
         .context("WebSocket connect failed")?;
@@ -90,6 +96,23 @@ pub async fn run(client: Client, workdir: String) -> Result<()> {
         if m.sender.username.eq_ignore_ascii_case(&my_username) || m.content.trim().is_empty() { continue; }
 
         println!("← @{}: {}", m.sender.username, m.content);
+
+        // Slash commands handled by the agent itself (no claude run).
+        let cmd = m.content.trim();
+        if cmd == "/clear" {
+            {
+                let mut s = sessions.lock().await;
+                if s.remove(&m.conversation_id).is_some() { save_sessions(&s); }
+            }
+            let _ = client.send(&m.conversation_id, "🧹 Context cleared — starting fresh.").await;
+            continue;
+        }
+        if cmd == "/help" {
+            let _ = client.send(&m.conversation_id,
+                "I'm a Claude Code agent running on this machine. Just message me — I keep context across the conversation.\n\n• /clear — start fresh (drop context)\n• /help — this message").await;
+            continue;
+        }
+
         let client = client.clone();
         let workdir = workdir.clone();
         let sessions = sessions.clone();
