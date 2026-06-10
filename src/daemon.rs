@@ -1,0 +1,79 @@
+//! Background daemon control — detach from the terminal so the agent keeps
+//! running after the shell is closed (setsid + log file + pid file), plus
+//! `stop` / `status`.
+
+use anyhow::{Context, Result};
+use std::fs;
+use std::io::Write;
+use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+
+fn dir() -> Result<PathBuf> {
+    let home = std::env::var("HOME").context("no HOME")?;
+    let d = PathBuf::from(home).join(".mafold");
+    fs::create_dir_all(&d)?;
+    Ok(d)
+}
+fn pid_path() -> Result<PathBuf> { Ok(dir()?.join("agent.pid")) }
+fn log_path() -> Result<PathBuf> { Ok(dir()?.join("agent.log")) }
+
+fn read_pid() -> Option<i32> {
+    fs::read_to_string(pid_path().ok()?).ok()?.trim().parse().ok()
+}
+fn alive(pid: i32) -> bool { unsafe { libc::kill(pid, 0) == 0 } }
+
+/// Re-exec ourselves in a new session (detached from the controlling terminal),
+/// with stdio redirected to a log file. The parent records the pid and exits.
+pub fn start_detached(base: &str, token: &str, workdir: &str) -> Result<u32> {
+    if let Some(pid) = read_pid() {
+        if alive(pid) {
+            anyhow::bail!("agent already running (pid {pid}) — run `mafold-cli stop` first");
+        }
+    }
+    let exe = std::env::current_exe()?;
+    let out = fs::OpenOptions::new().create(true).append(true).open(log_path()?)?;
+    let err = out.try_clone()?;
+
+    let mut cmd = Command::new(exe);
+    cmd.arg("agent")
+        .env("MAFOLD_BASE", base)
+        .env("MAFOLD_BOT_TOKEN", token)
+        .env("MAFOLD_WORKDIR", workdir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(out))
+        .stderr(Stdio::from(err));
+    // New session → no controlling terminal → survives the shell closing.
+    unsafe {
+        cmd.pre_exec(|| {
+            unsafe { libc::setsid() };
+            Ok(())
+        });
+    }
+    let child = cmd.spawn().context("failed to spawn background agent")?;
+    let pid = child.id();
+    writeln!(fs::File::create(pid_path()?)?, "{pid}")?;
+    Ok(pid)
+}
+
+pub fn stop() -> Result<()> {
+    match read_pid() {
+        Some(pid) if alive(pid) => {
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+            let _ = fs::remove_file(pid_path()?);
+            println!("✓ stopped agent (pid {pid})");
+        }
+        _ => println!("no running agent"),
+    }
+    Ok(())
+}
+
+pub fn status() -> Result<()> {
+    match read_pid() {
+        Some(pid) if alive(pid) => {
+            println!("agent running (pid {pid}) · logs: ~/.mafold/agent.log");
+        }
+        _ => println!("agent not running"),
+    }
+    Ok(())
+}

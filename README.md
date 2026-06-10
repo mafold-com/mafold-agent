@@ -16,11 +16,13 @@ Auth is a **bot token** (`mb_…`) — create a bot in the Mafold app — via
 
 ```sh
 bash <(curl -fsSL https://raw.githubusercontent.com/mafold-com/mafold-cli/main/install.sh) \
-  agent --token mb_xxxx --workdir ~/your-repo
+  agent --detach --token mb_xxxx --workdir ~/your-repo
 ```
 
-The installer downloads the official release binary for your platform and runs
-it. Or build from source: `cargo build --release`.
+It runs in the **background** (detached from the terminal — keeps running after
+you close the shell), logging to `~/.mafold/agent.log`. Manage it with
+`mafold-cli status` and `mafold-cli stop`. Drop `--detach` to run in the
+foreground. Or build from source: `cargo build --release`.
 
 ## `agent`
 

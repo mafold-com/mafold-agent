@@ -8,6 +8,7 @@
 
 mod agent;
 mod client;
+mod daemon;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -31,7 +32,15 @@ enum Cmd {
     Agent {
         #[arg(long, env = "MAFOLD_WORKDIR", default_value = ".")]
         workdir: String,
+        /// Run in the background (detached from the terminal) so it keeps
+        /// running after you close the shell. Logs to ~/.mafold/agent.log.
+        #[arg(long, short)]
+        detach: bool,
     },
+    /// Stop a background agent started with `agent --detach`.
+    Stop,
+    /// Show whether a background agent is running.
+    Status,
     /// List your conversations.
     Chats,
     /// Send a message. <chat> is a conversation id or a @username.
@@ -45,15 +54,30 @@ enum Cmd {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Daemon control needs no auth.
+    if matches!(cli.cmd, Cmd::Stop) { return daemon::stop(); }
+    if matches!(cli.cmd, Cmd::Status) { return daemon::status(); }
+
     let token = cli
         .token
         .context("set --token or $MAFOLD_BOT_TOKEN (your bot's mb_ token — create a bot in the Mafold app)")?;
-    let client = Client::new(cli.base, token);
 
     match cli.cmd {
-        Cmd::Agent { workdir } => agent::run(client, workdir).await?,
-        Cmd::Chats => chats(&client).await?,
-        Cmd::Send { chat, text } => send(&client, &chat, &text.join(" ")).await?,
+        Cmd::Agent { workdir, detach } => {
+            if detach {
+                let pid = daemon::start_detached(&cli.base, &token, &workdir)?;
+                println!("✓ agent running in background (pid {pid})");
+                println!("  logs:   ~/.mafold/agent.log");
+                println!("  status: mafold-cli status");
+                println!("  stop:   mafold-cli stop");
+            } else {
+                agent::run(Client::new(cli.base, token), workdir).await?;
+            }
+        }
+        Cmd::Chats => chats(&Client::new(cli.base, token)).await?,
+        Cmd::Send { chat, text } => send(&Client::new(cli.base, token), &chat, &text.join(" ")).await?,
+        Cmd::Stop | Cmd::Status => unreachable!(),
     }
     Ok(())
 }
