@@ -134,6 +134,10 @@ async fn handle(http: &reqwest::Client, cfg: &Config, chat_id: &str, prompt: &st
         .arg("--include-partial-messages")
         .arg("--dangerously-skip-permissions") // autonomous; P2 adds a policy
         .current_dir(&cfg.workdir)
+        // Avoid the "already inside Claude Code" nested-session guard, and use
+        // the user's subscription auth rather than an inherited API key.
+        .env_remove("CLAUDECODE")
+        .env_remove("ANTHROPIC_API_KEY")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
